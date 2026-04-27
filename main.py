@@ -7,6 +7,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from services.hal import get_hal_stats, get_project_stats, get_listic_stats
 from services.dblp import get_dblp_stats
 from services.advanced_stats import get_aggregated_stats, compute_collaborations
+from services.ml_clustering import perform_clustering
 from pydantic import BaseModel
 
 app = FastAPI(title="LISTIC Dashboard API")
@@ -189,7 +190,7 @@ async def fetch_aggregated_stats(request: AggregatedRequest):
     if not request.researchers:
         return {"error": "No researchers provided."}
         
-    stats = await get_aggregated_stats(request.researchers, request.start_year, request.end_year)
+    stats = await get_aggregated_stats(db, request.researchers, request.start_year, request.end_year)
     
     collaborations = {"pairs": [], "triples": [], "unconnected": []}
     if "publications" in stats and stats["publications"]:
@@ -199,3 +200,108 @@ async def fetch_aggregated_stats(request: AggregatedRequest):
         "stats": stats,
         "collaborations": collaborations
     }
+
+@app.get("/api/analytics/cluster")
+async def get_clustering(granularity: float = 0.5):
+    """
+    Returns thematic clustering of researchers based on their publication keywords.
+    Granularity controls how many clusters are formed (0.0 to 1.0).
+    """
+    return await perform_clustering(db, granularity)
+
+@app.get("/api/researchers/cards")
+async def get_researcher_cards():
+    """
+    Returns all researchers with their publication and project counts from the local DB.
+    This is the fast endpoint for the Researcher Grid - no HAL calls needed.
+    """
+    cursor = db.researchers.find({}, {"_id": 0})
+    researchers = await cursor.to_list(length=1000)
+    
+    result = []
+    for r in researchers:
+        uid = r["_unique_id"]
+        # Count publications from local warehouse
+        pub_count = await db.publications.count_documents({"listic_author_ids": uid})
+        # Count projects (any project that mentions the researcher by name)
+        proj_count = await db.projects.count_documents({
+            "$or": [
+                {"RESPONSABLE_SCIENTIFIQUE": {"$regex": r.get("name", ""), "$options": "i"}},
+                {"MEMBRES": {"$regex": r.get("name", ""), "$options": "i"}}
+            ]
+        })
+        result.append({
+            **r,
+            "pub_count": pub_count,
+            "project_count": proj_count
+        })
+    return result
+
+@app.get("/api/researchers/{uid}/publications")
+async def get_researcher_publications(uid: str, start_year: Optional[int] = None, end_year: Optional[int] = None):
+    """
+    Returns deduplicated publications for a single researcher from the local DB warehouse.
+    """
+    query = {"listic_author_ids": uid}
+    if start_year or end_year:
+        s = start_year or 0
+        e = end_year or 9999
+        query["producedDateY_i"] = {"$gte": s, "$lte": e}
+    
+    cursor = db.publications.find(query, {"_id": 0}).sort("producedDateY_i", -1)
+    pubs = await cursor.to_list(length=5000)
+    return {"total": len(pubs), "publications": pubs}
+
+@app.get("/api/analytics/inconsistencies")
+async def get_inconsistencies():
+    """
+    Run inconsistency check: compare researchers in DB against publications warehouse.
+    Returns list of flagged issues.
+    """
+    cursor = db.researchers.find({}, {"_id": 0, "name": 1, "_unique_id": 1, "category": 1, "url_listic": 1})
+    researchers = await cursor.to_list(length=1000)
+    
+    issues = []
+    for r in researchers:
+        uid = r["_unique_id"]
+        name = r.get("name", "")
+        category = r.get("category", "")
+        pub_count = await db.publications.count_documents({"listic_author_ids": uid})
+        
+        # Rule 1: Active researcher (faculty) with 0 publications in our warehouse
+        if category == "enseignants_chercheurs" and pub_count == 0:
+            issues.append({
+                "severity": "high",
+                "type": "missing_hal_data",
+                "researcher": name,
+                "researcher_id": uid,
+                "message": f"Active faculty member '{name}' has 0 publications indexed in HAL.",
+                "sources": ["Lab Website: Active", "HAL: 0 publications"]
+            })
+        # Rule 2: Researcher with very few publications (possible missing HAL profile)
+        elif category == "enseignants_chercheurs" and pub_count < 3:
+            issues.append({
+                "severity": "medium",
+                "type": "low_hal_coverage",
+                "researcher": name,
+                "researcher_id": uid,
+                "message": f"'{name}' has only {pub_count} publication(s) in HAL - possible incomplete profile.",
+                "sources": [f"HAL: {pub_count} publication(s)"]
+            })
+    
+    return {
+        "total_issues": len(issues),
+        "high_severity": sum(1 for i in issues if i["severity"] == "high"),
+        "medium_severity": sum(1 for i in issues if i["severity"] == "medium"),
+        "issues": issues
+    }
+
+@app.get("/api/sync/hal")
+async def trigger_hal_sync():
+    """
+    Manually trigger the HAL synchronization worker.
+    """
+    import asyncio
+    from services.sync_worker import sync_hal_publications
+    asyncio.create_task(sync_hal_publications())
+    return {"message": "HAL sync started in background. Check server logs for progress."}

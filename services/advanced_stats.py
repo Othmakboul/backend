@@ -4,63 +4,58 @@ import httpx
 
 HAL_API_URL = "https://api.archives-ouvertes.fr/search/"
 
-async def get_aggregated_stats(researchers: List[str], start_year: Optional[int], end_year: Optional[int]):
+async def get_aggregated_stats(db, researchers: List[str], start_year: Optional[int], end_year: Optional[int]):
     """
-    Fetches and deduplicates publications for a list of researchers.
+    Fetches deduplicated publications from MongoDB for a list of researcher names.
+    Since 'publications' already stores deduplicated entries, we just query it.
     """
-    # Construct HAL query for multiple authors
-    # Example: authFullName_s:("Flavien" OR "Sébastien")
-    
-    author_queries = [f'"{name}"' for name in researchers]
-    query = f'authFullName_t:({" OR ".join(author_queries)})'
-    
-    fl = "halId_s,title_s,producedDateY_i,docType_s,authFullName_s,journalTitle_s,keyword_s"
-    
-    params = {
-        "q": query,
-        "wt": "json",
-        "fl": fl,
-        "rows": 500, # Assume max 500 for now, could be paginated
-        "sort": "producedDateY_i desc"
-    }
-    
-    if start_year or end_year:
-        s = start_year if start_year else "*"
-        e = end_year if end_year else "*"
-        params["fq"] = f"producedDateY_i:[{s} TO {e}]"
+    try:
+        # 1. Map researcher names to _unique_id (since we store listic_author_ids)
+        cursor = db.researchers.find({"name": {"$in": researchers}}, {"_unique_id": 1, "name": 1})
+        matched_researchers = await cursor.to_list(length=1000)
         
-    async with httpx.AsyncClient() as client:
-        try:
-            print(f"DEBUG: HAL Query Params: {params}", flush=True)
-            response = await client.get(HAL_API_URL, params=params, timeout=10.0)
-            print(f"DEBUG: HAL Request URL: {response.url}", flush=True)
-            response.raise_for_status()
-            data = response.json()
-            docs = data.get("response", {}).get("docs", [])
-            
-            # Deduplicate by halId_s
-            unique_docs = {}
-            for d in docs:
-                hal_id = d.get("halId_s")
-                if hal_id and hal_id not in unique_docs:
-                    unique_docs[hal_id] = d
-            
-            final_docs = list(unique_docs.values())
-            
-            # Aggregate stats
-            years = [d.get("producedDateY_i") for d in final_docs if d.get("producedDateY_i")]
-            types = [d.get("docType_s") for d in final_docs if d.get("docType_s")]
-            
+        researcher_ids = [r["_unique_id"] for r in matched_researchers]
+        
+        if not researcher_ids:
             return {
-                "total_publications": len(final_docs),
-                "years_distribution": dict(Counter(years)),
-                "types_distribution": dict(Counter(types)),
-                "publications": final_docs
+                "total_publications": 0,
+                "years_distribution": {},
+                "types_distribution": {},
+                "publications": []
             }
             
-        except Exception as e:
-            print(f"Error fetching aggregated stats: {e}")
-            return {"error": str(e)}
+        # 2. Build the query for publications
+        query = {
+            "listic_author_ids": {"$in": researcher_ids}
+        }
+        
+        if start_year or end_year:
+            s = start_year if start_year else 0
+            e = end_year if end_year else 9999
+            query["producedDateY_i"] = {"$gte": s, "$lte": e}
+            
+        # 3. Fetch from DB
+        pubs_cursor = db.publications.find(query).sort("producedDateY_i", -1)
+        final_docs = await pubs_cursor.to_list(length=5000)
+        
+        # 4. Aggregate stats
+        years = [d.get("producedDateY_i") for d in final_docs if d.get("producedDateY_i")]
+        types = [d.get("docType_s") for d in final_docs if d.get("docType_s")]
+        
+        # 5. Remove _id for JSON serialization
+        for d in final_docs:
+            d.pop("_id", None)
+        
+        return {
+            "total_publications": len(final_docs),
+            "years_distribution": dict(Counter(years)),
+            "types_distribution": dict(Counter(types)),
+            "publications": final_docs
+        }
+        
+    except Exception as e:
+        print(f"Error fetching aggregated stats from DB: {e}")
+        return {"error": str(e)}
 
 async def compute_collaborations(publications: List[dict], researchers: List[str]):
     """
