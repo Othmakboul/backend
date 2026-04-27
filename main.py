@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from services.hal import get_hal_stats, get_project_stats, get_listic_stats
 from services.dblp import get_dblp_stats
+from services.advanced_stats import get_aggregated_stats, compute_collaborations
+from pydantic import BaseModel
 
 app = FastAPI(title="LISTIC Dashboard API")
 
@@ -29,6 +31,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class AggregatedRequest(BaseModel):
+    researchers: List[str]
+    start_year: Optional[int] = None
+    end_year: Optional[int] = None
 
 async def seed_data():
     """Reads JSON files and populates MongoDB if collections are empty."""
@@ -175,4 +182,20 @@ async def get_researcher_details(uid: str, start_year: Optional[int] = None, end
             "hal": hal_data,
             "dblp": dblp_data
         }
+    }
+
+@app.post("/api/advanced/aggregated-stats")
+async def fetch_aggregated_stats(request: AggregatedRequest):
+    if not request.researchers:
+        return {"error": "No researchers provided."}
+        
+    stats = await get_aggregated_stats(request.researchers, request.start_year, request.end_year)
+    
+    collaborations = {"pairs": [], "triples": [], "unconnected": []}
+    if "publications" in stats and stats["publications"]:
+        collaborations = await compute_collaborations(stats["publications"], request.researchers)
+        
+    return {
+        "stats": stats,
+        "collaborations": collaborations
     }
