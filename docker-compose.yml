@@ -5,6 +5,12 @@ services:
       - "27018:27017"
     volumes:
       - mongo_data:/data/db
+    restart: always
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   backend:
     build: .
@@ -17,8 +23,10 @@ services:
     volumes:
       # Mount the database directory so the backend can seed the data
       - ../listic-database:/app/data
+    restart: always
     depends_on:
-      - mongodb
+      mongodb:
+        condition: service_healthy
 
   frontend:
     build: ../frontend
