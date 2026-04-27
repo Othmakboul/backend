@@ -20,6 +20,7 @@ services:
       - MONGODB_URL=mongodb://mongodb:27017
       - DATA_PATH_RESEARCHERS=/app/data/listic personnes/listic_personnes.complete_structure.json
       - DATA_PATH_PROJECTS=/app/data/listic_projet/listic_projets.complete_structure.json
+      - DATA_PATH_DOCTORANTS=/app/data/listic personnes/listic_personnes.doctorants.json
     volumes:
       # Mount the database directory so the backend can seed the data
       - ../listic-database:/app/data
