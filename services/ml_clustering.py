@@ -16,12 +16,16 @@ def names_match(a: str, b: str) -> bool:
     return na in nb or nb in na
 
 
-async def perform_clustering(db, granularity: float):
+async def perform_clustering(db, granularity: float, researcher_ids: list = None):
     """
     Clusters researchers by publication keywords + thesis subjects of their PhD students.
     Granularity 0.0 = 1 big cluster, 1.0 = one cluster per researcher.
+    If researcher_ids is provided, only cluster those researchers.
     """
-    researchers_cursor = db.researchers.find({}, {"_unique_id": 1, "name": 1})
+    query = {}
+    if researcher_ids:
+        query["_unique_id"] = {"$in": researcher_ids}
+    researchers_cursor = db.researchers.find(query, {"_unique_id": 1, "name": 1})
     researchers = await researchers_cursor.to_list(length=1000)
 
     if not researchers:
